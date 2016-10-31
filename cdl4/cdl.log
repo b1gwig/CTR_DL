@@ -1,1 +1,3 @@
 p4: lambda_v/lambda_u/ratio/K: 10.000000/1.000000/0.010000/50
+Epoch 1 - tr_err/bcd_err/rec_err: 53780594.8/27755.0/53752839.8
+Epoch 2 - tr_err/bcd_err/rec_err: 53729423.8/27720.6/53701703.1

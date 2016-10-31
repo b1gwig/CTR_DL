@@ -34,6 +34,7 @@ class Monitor(object):
 class Solver(object):
     def __init__(self, optimizer, **kwargs):
         if isinstance(optimizer, str):
+            # ['ccsgd', 'sgld', 'nag', 'rmsprop', 'adam', 'adadelta', 'test', 'adagrad', 'sgd']
             self.optimizer = mx.optimizer.create(optimizer, **kwargs)
         else:
             self.optimizer = optimizer
@@ -41,7 +42,6 @@ class Solver(object):
         self.monitor = None
         self.metric = None
         self.iter_end_callback = None
-        self.iter_start_callback = None
 
     def set_metric(self, metric):
         self.metric = metric
@@ -52,11 +52,16 @@ class Solver(object):
     def set_iter_end_callback(self, callback):
         self.iter_end_callback = callback
 
-    def set_iter_start_callback(self, callback):
-        self.iter_start_callback = callback
+    def solve(self, X, R, V,
+              lambda_v_rt, lambda_u, lambda_v,
+              dir_save, batch_size, xpu, sym,
+              args, args_grad, auxs,
+              data_iter, begin_iter, end_iter):
 
-    def solve(self, X, R, V, lambda_v_rt, lambda_u, lambda_v, dir_save, batch_size, xpu, sym, args, args_grad, auxs,
-              data_iter, begin_iter, end_iter, args_lrmult={}, debug = False):
+
+        ###################################
+        # ADD V, data, lambda_v_rt to args
+        ###################################
         # names and shapes
         input_desc = data_iter.provide_data + data_iter.provide_label
         input_names = [k for k, shape in input_desc]
@@ -64,27 +69,24 @@ class Solver(object):
         input_buffs = [mx.nd.empty(shape, ctx=xpu) for k, shape in input_desc]
         args = dict(args, **dict(zip(input_names, input_buffs)))
 
+        ############################################
+        # sym <= mx.symbol.Group([fe_loss, fr_loss])
+        ############################################
         # list all outputs (strings)
+        #   -> ['linearregressionoutput2_output', 'linearregressionoutput3_output']
         output_names = sym.list_outputs()
-        if debug:
-            sym = sym.get_internals()
-            blob_names = sym.list_outputs()
-            sym_group = []
-            for i in range(len(blob_names)):
-                if blob_names[i] not in args:
-                    x = sym[i]
-                    if blob_names[i] not in output_names:
-                        x = mx.symbol.BlockGrad(x, name=blob_names[i])
-                    sym_group.append(x)
-            sym = mx.symbol.Group(sym_group)
+
         # bind the network params to the network (symbol)
         exe = sym.bind(xpu, args=args, args_grad=args_grad, aux_states=auxs)
 
+        ################################################
+        # set up batch
+        # batch size rows will be patched to input_buffs
+        ################################################
         assert len(sym.list_arguments()) == len(exe.grad_arrays)
         update_dict = {name: nd for name, nd in zip(sym.list_arguments(), exe.grad_arrays) if nd}
         batch_size = input_buffs[0].shape[0]
         self.optimizer.rescale_grad = 1.0/batch_size
-        self.optimizer.set_lr_mult(args_lrmult)
 
         output_dict = {}
         output_buff = {}
@@ -109,24 +111,19 @@ class Solver(object):
             batch_size=batch_size, shuffle=False,
             last_batch_handle='pad')
         data_iter.reset()
+
+        # start epoch
         for i in range(begin_iter, end_iter):
-            if self.iter_start_callback is not None:
-                if self.iter_start_callback(i):
-                    return
-            #if i==100:
-            #    V = np.zeros(V.shape)
-            #    data_iter = mx.io.NDArrayIter({'data': X, 'V': V, 'lambda_v_rt':
-            #        lambda_v_rt},
-            #        batch_size=batch_size, shuffle=False,
-            #        last_batch_handle='pad')
-            #    data_iter.reset()
-            #    for j in range(10):
-            #        batch = data_iter.next()
+
             try:
                 batch = data_iter.next()
             except:
-                # means the end of an epoch
+                ###########################################################################
+                # if iteration raises error, it means the end of an epoch. so update layers
+                ###########################################################################
                 epoch += 1
+
+                # in model.py extract_feature, it calls data_iter.hard_reset()
                 theta = model.extract_feature(sym[0], args, auxs,
                     data_iter, X.shape[0], xpu).values()[0]
                 # update U, V and get BCD loss
@@ -150,22 +147,32 @@ class Solver(object):
                 data_iter.reset()
                 batch = data_iter.next()
 
+            #############################
+            # block operation procedure in ONE epoch
+            #############################
+
+            # 1111
             for data, buff in zip(batch.data+batch.label, input_buffs):
                 # copy data from batch to input_buffs
                 # input_buffs is used during ff and bp
                 # buffs->args->exe
                 data.copyto(buff)
             exe.forward(is_train=True)
+
             if self.monitor is not None:
                 self.monitor.forward_end(i, internal_dict)
+
             for key in output_dict:
                 # output_buff is used for computing metrics
                 output_dict[key].copyto(output_buff[key])
 
             exe.backward()
+
+            # 222
             for key, arr in update_dict.items():
                 self.updater(key, arr, args[key])
 
+            # matrix is l2 nom
             if self.metric is not None:
                 self.metric.update([input_buffs[-1]],
                                    [output_buff[output_names[0]]])
